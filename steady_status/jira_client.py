@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Iterable
 
 import requests
@@ -40,6 +41,61 @@ def _auth_header(email: str, api_token: str) -> str:
     return "Basic " + base64.b64encode(raw).decode("ascii")
 
 
+def _impediment_flag_value_truthy(raw: Any) -> bool:
+    """
+    True when a Jira issue field indicates the issue is flagged / blocked.
+
+    Jira Cloud usually stores this as the **Flagged** custom field with option
+    ``Impediment`` (list of ``{\"value\": \"Impediment\", ...}``). Some sites also
+    expose a boolean ``flagged`` field—handled here. Arbitrary non-empty option
+    lists are *not* treated as flagged (avoids false positives on other selects).
+    """
+    if raw is True:
+        return True
+    if raw is None or raw is False:
+        return False
+    if isinstance(raw, str):
+        lowered = raw.strip().lower()
+        return lowered in {"impediment", "true", "yes"}
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                option_label = str(item.get("value") or item.get("name") or "").strip().lower()
+                if option_label == "impediment":
+                    return True
+        return False
+    if isinstance(raw, dict):
+        option_label = str(raw.get("value") or raw.get("name") or "").strip().lower()
+        return option_label == "impediment"
+    return False
+
+
+def _normalize_jira_iso8601(created: str) -> str:
+    """Normalize Jira ``created`` strings so :func:`datetime.fromisoformat` accepts them."""
+    s = created.strip()
+    if not s:
+        return s
+    if s.endswith("Z"):
+        return s[:-1] + "+00:00"
+    if re.search(r"[+-]\d{4}$", s):
+        return s[:-2] + ":" + s[-2:]
+    return s
+
+
+def _parse_jira_created(created: str) -> datetime:
+    """Parse Jira comment/issue timestamps for ordering (UTC when offset is present)."""
+    normalized = _normalize_jira_iso8601(created)
+    if not normalized:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+
 class JiraClient:
     """
     Thin wrapper around JIRA Cloud REST API v3.
@@ -63,6 +119,9 @@ class JiraClient:
         )
         self._base = settings.jira_base_url.rstrip("/")
         self._issue_summary_cache: dict[str, str] = {}
+        #: Resolved REST ``id`` for the field named "Flagged" (see :meth:`_resolve_flagged_field_id`).
+        self._cached_flagged_field_id: str | None = None
+        self._flagged_field_metadata_loaded: bool = False
 
     def issue_url(self, key: str) -> str:
         """Browse URL for an issue key."""
@@ -225,6 +284,135 @@ class JiraClient:
                 break
         return False
 
+    def _resolve_flagged_field_id(self) -> str | None:
+        """
+        Return the REST field id (e.g. ``customfield_10021``) for Jira's **Flagged** field.
+
+        Uses ``JIRA_FLAGGED_FIELD_ID`` when set. Otherwise calls ``GET /rest/api/3/field``
+        once and caches the field whose name is ``Flagged`` (case-insensitive). Many Cloud
+        sites never populate the legacy ``flagged`` key on issues even when the ticket is
+        flagged—the impediment lives on that custom field instead.
+        """
+        configured = self._settings.jira_flagged_field_id
+        if configured:
+            return configured
+        if self._flagged_field_metadata_loaded:
+            return self._cached_flagged_field_id
+        self._flagged_field_metadata_loaded = True
+        url = f"{self._base}/rest/api/3/field"
+        resp = self._session.get(url, timeout=90)
+        resp.raise_for_status()
+        for field in resp.json():
+            name = (field.get("name") or "").strip().lower()
+            if name != "flagged":
+                continue
+            field_id = field.get("id")
+            if isinstance(field_id, str) and field_id.strip():
+                self._cached_flagged_field_id = field_id.strip()
+                return self._cached_flagged_field_id
+        self._cached_flagged_field_id = None
+        return None
+
+    def _fields_indicate_flagged(self, fields: dict[str, Any]) -> bool:
+        """True when loaded issue ``fields`` represent a flagged / impediment issue."""
+        if _impediment_flag_value_truthy(fields.get("flagged")):
+            return True
+        resolved_id = self._resolve_flagged_field_id()
+        if resolved_id and _impediment_flag_value_truthy(fields.get(resolved_id)):
+            return True
+        return False
+
+    def issue_is_flagged(self, issue_key: str) -> bool:
+        """
+        Return True when Jira marks ``issue_key`` as flagged (impediment).
+
+        Loads the **Flagged** custom field when discoverable (field named ``Flagged``
+        from ``GET /rest/api/3/field``) plus the ``flagged`` property when requested,
+        and interprets standard Impediment option shapes—see
+        :func:`_impediment_flag_value_truthy`.
+        """
+        resolved = self._resolve_flagged_field_id()
+        field_names_ordered: list[str] = []
+        if resolved:
+            field_names_ordered.append(resolved)
+        field_names_ordered.append("flagged")
+
+        url = f"{self._base}/rest/api/3/issue/{issue_key}"
+        params = {"fields": ",".join(field_names_ordered)}
+        resp = self._session.get(url, params=params, timeout=60)
+        if resp.status_code == 400 and resolved:
+            resp = self._session.get(
+                url,
+                params={"fields": resolved},
+                timeout=60,
+            )
+        resp.raise_for_status()
+        issue_fields = resp.json().get("fields") or {}
+        return self._fields_indicate_flagged(issue_fields)
+
+    def get_my_most_recent_comment_containing(
+        self,
+        issue_key: str,
+        substring: str,
+        *,
+        whole_word: bool = False,
+    ) -> str | None:
+        """
+        Return plain text of your newest comment on ``issue_key`` whose body matches ``substring``.
+
+        By default matching is a case-insensitive substring search over ADF plain text.
+        With ``whole_word=True``, ``substring`` must appear as a whole word (so e.g.
+        "Unblocked" does not match "Blocked").
+
+        If several of your comments match, the one with the latest ``created`` timestamp
+        wins. Returns ``None`` when there is no matching comment.
+        """
+        needle = substring.strip()
+        if not needle:
+            return None
+
+        url = f"{self._base}/rest/api/3/issue/{issue_key}/comment"
+        start_at = 0
+        page_size = 50
+        best_created: datetime | None = None
+        best_text: str | None = None
+
+        while True:
+            resp = self._session.get(
+                url,
+                params={"startAt": start_at, "maxResults": page_size},
+                timeout=60,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            comments = data.get("comments") or []
+            total = int(data.get("total", start_at + len(comments)))
+
+            for comment in comments:
+                author = comment.get("author") or {}
+                if not self.is_comment_author_me(author):
+                    continue
+                body = comment.get("body")
+                body_doc = body if isinstance(body, dict) else {}
+                text = _adf_extract_text(body_doc).strip()
+                if whole_word:
+                    if re.search(rf"\b{re.escape(needle)}\b", text, flags=re.IGNORECASE) is None:
+                        continue
+                else:
+                    if needle.lower() not in text.lower():
+                        continue
+                created_raw = (comment.get("created") or "").strip()
+                created_dt = _parse_jira_created(created_raw)
+                if best_created is None or created_dt > best_created:
+                    best_created = created_dt
+                    best_text = text
+
+            start_at += len(comments)
+            if start_at >= total or not comments:
+                break
+
+        return best_text
+
 
 def _adf_extract_text(node: dict[str, Any]) -> str:
     """Concatenate all ADF ``text`` nodes under ``node`` (preserves inline order)."""
@@ -302,6 +490,26 @@ def rt_comment_approval_emoji(client: JiraClient, issue_key: str) -> str:
     return "🔙"
 
 
+def partition_development_and_rt(
+    issues: Iterable[JiraIssue],
+    client: JiraClient,
+) -> tuple[list[JiraIssue], list[JiraIssue]]:
+    """
+    Split **non-deploy** issues into development vs R&T using the same summary
+    substring rule as :func:`partition_today_bundle`.
+
+    Deploy issues must be removed by the caller; they are not accepted here.
+    """
+    development: list[JiraIssue] = []
+    rt: list[JiraIssue] = []
+    for issue in issues:
+        if client.is_rt_summary(issue):
+            rt.append(issue)
+        else:
+            development.append(issue)
+    return development, rt
+
+
 def partition_today_bundle(
     issues: Iterable[JiraIssue],
     client: JiraClient,
@@ -314,14 +522,11 @@ def partition_today_bundle(
     remainder.
     """
     deploy: list[JiraIssue] = []
-    development: list[JiraIssue] = []
-    rt: list[JiraIssue] = []
+    non_deploy: list[JiraIssue] = []
     for issue in issues:
         if client.is_deploy_issue(issue):
             deploy.append(issue)
-            continue
-        if client.is_rt_summary(issue):
-            rt.append(issue)
         else:
-            development.append(issue)
+            non_deploy.append(issue)
+    development, rt = partition_development_and_rt(non_deploy, client)
     return deploy, development, rt

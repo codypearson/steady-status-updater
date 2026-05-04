@@ -18,6 +18,7 @@ from steady_status.ical_feed import (
 from steady_status.jira_client import (
     JiraClient,
     JiraIssue,
+    partition_development_and_rt,
     partition_today_bundle,
     rt_comment_approval_emoji,
 )
@@ -30,6 +31,24 @@ def _md_browse_link(client: JiraClient, key: str, summary: str) -> str:
 def _display_issue_link(client: JiraClient, issue: JiraIssue) -> str:
     """Markdown link line using parent ticket key/title when the row is a subtask."""
     return _md_browse_link(client, issue.display_key(), issue.display_summary())
+
+
+def _group_issues_by_parent(issues: list[JiraIssue]) -> list[list[JiraIssue]]:
+    """
+    Bucket issues by parent story key (or the issue's own key when not a subtask).
+
+    Order follows the input list: the first time a parent appears, that group is
+    opened; further subtasks with the same parent append to that group.
+    """
+    order: list[str] = []
+    buckets: dict[str, list[JiraIssue]] = {}
+    for issue in issues:
+        group_key = issue.parent_key or issue.key
+        if group_key not in buckets:
+            order.append(group_key)
+            buckets[group_key] = []
+        buckets[group_key].append(issue)
+    return [buckets[key] for key in order]
 
 
 def next_weekday_after(anchor: date) -> date:
@@ -52,15 +71,16 @@ def _lines_development_today(
     """
     Markdown lines under **Development** for today's completed work.
 
-    Uses parent key/title on the top bullet when applicable; a nested list
-    item (indented ``*``) holds the subtask title only.
+    Uses parent key/title on the top bullet when applicable; nested ``*`` lines
+    list subtask titles. Multiple subtasks under the same parent share one top bullet.
     """
     lines: list[str] = []
-    for issue in issues:
-        link = _display_issue_link(client, issue)
-        lines.append(f"* {link}")
-        if issue.parent_key:
-            lines.append(f"  * {issue.summary}")
+    for group in _group_issues_by_parent(issues):
+        first = group[0]
+        lines.append(f"* {_display_issue_link(client, first)}")
+        if first.parent_key:
+            for issue in group:
+                lines.append(f"  * {issue.summary}")
     return lines
 
 
@@ -69,24 +89,43 @@ def _lines_rt_today(
     issues: list[JiraIssue],
 ) -> list[str]:
     """
-    Markdown lines under **R&T** with approval emoji.
+    Markdown lines under **Today** → **R&T** with per-issue approval emoji.
 
     ☑️ when your issue comment includes the configured approval header (see
     ``JIRA_RT_APPROVED_COMMENT_HEADER``); otherwise 🔙.
+
+    Subtasks under the same parent share one parent link line; each nested line
+    carries the approval emoji and subtask summary. Tomorrow’s **R&T** list does
+    not use this formatting—see :func:`_lines_rt_tomorrow`.
     """
     lines: list[str] = []
-    for issue in issues:
-        emoji = rt_comment_approval_emoji(client, issue.key)
-        link = _display_issue_link(client, issue)
-        lines.append(f"* {emoji} {link}")
+    for group in _group_issues_by_parent(issues):
+        first = group[0]
+        if first.parent_key:
+            lines.append(f"* {_display_issue_link(client, first)}")
+            for issue in group:
+                emoji = rt_comment_approval_emoji(client, issue.key)
+                lines.append(f"  * {emoji} {issue.summary}")
+        else:
+            issue = group[0]
+            emoji = rt_comment_approval_emoji(client, issue.key)
+            lines.append(f"* {emoji} {_display_issue_link(client, issue)}")
     return lines
 
 
 def _lines_deploy(client: JiraClient, issues: list[JiraIssue]) -> list[str]:
-    """Non-Development bullets with rocket emoji."""
-    return [
-        f"* 🚀 {_display_issue_link(client, issue)}" for issue in issues
-    ]
+    """
+    Non-Development bullets with rocket emoji.
+
+    Subtasks that share a parent are collapsed to one ``🚀`` line (parent key /
+    title only). Nested bullets are omitted—Deploy subtask summaries are often
+    generic (e.g. \"Deploy\") and add noise next to the emoji.
+    """
+    lines: list[str] = []
+    for group in _group_issues_by_parent(issues):
+        first = group[0]
+        lines.append(f"* 🚀 {_display_issue_link(client, first)}")
+    return lines
 
 
 def _lines_meetings(events: list[CalendarEvent]) -> list[str]:
@@ -94,12 +133,83 @@ def _lines_meetings(events: list[CalendarEvent]) -> list[str]:
 
 
 def _lines_development_tomorrow(client: JiraClient, issues: list[JiraIssue]) -> list[str]:
-    """Next business day planning: issue links only."""
+    """Next business day **Development**: issue links; subtasks nested under the parent line."""
     if not issues:
         return []
-    return [
-        f"* {_display_issue_link(client, issue)}" for issue in issues
-    ]
+    lines: list[str] = []
+    for group in _group_issues_by_parent(issues):
+        first = group[0]
+        lines.append(f"* {_display_issue_link(client, first)}")
+        if first.parent_key:
+            for issue in group:
+                lines.append(f"  * {issue.summary}")
+    return lines
+
+
+def _lines_rt_tomorrow(client: JiraClient, issues: list[JiraIssue]) -> list[str]:
+    """
+    **Tomorrow** → **R&T**: one bullet per story (parent link when issues are subtasks).
+
+    Nested subtask titles are omitted—they are usually the literal \"Review & Test\" and
+    repeat the section heading without adding detail (same idea as :func:`_lines_deploy`).
+    """
+    if not issues:
+        return []
+    lines: list[str] = []
+    for group in _group_issues_by_parent(issues):
+        first = group[0]
+        lines.append(f"* {_display_issue_link(client, first)}")
+    return lines
+
+
+BLOCKED_COMMENT_TRIGGER = "Blocked"
+
+
+def _collect_flagged_blocked_entries(
+    client: JiraClient,
+    issues: list[JiraIssue],
+) -> list[tuple[JiraIssue, str | None]]:
+    """
+    Emit one **Blocked** row per flagged issue returned directly by the blocked-work filter.
+
+    Only ``issue.key`` for each filter row is considered (no parent lookup). The saved
+    filter (default ``FILTER_BLOCKED_PARENTS_ID`` / 12991) is expected to list those parent
+    tickets already. Dedupes repeated keys. Loads your ``Blocked`` comment from that issue.
+    """
+    rows: list[tuple[JiraIssue, str | None]] = []
+    seen_keys: set[str] = set()
+
+    for issue in issues:
+        if issue.key in seen_keys:
+            continue
+        if not client.issue_is_flagged(issue.key):
+            continue
+        seen_keys.add(issue.key)
+
+        blocked_note = client.get_my_most_recent_comment_containing(
+            issue.key,
+            BLOCKED_COMMENT_TRIGGER,
+            whole_word=True,
+        )
+        rows.append((issue, blocked_note))
+
+    return rows
+
+
+def _lines_blocked_section(
+    client: JiraClient,
+    rows: list[tuple[JiraIssue, str | None]],
+) -> list[str]:
+    """One Markdown bullet per blocked item: story/subtask link and optional blocked comment."""
+    lines: list[str] = []
+    for issue, blocked_note in rows:
+        link_line = _display_issue_link(client, issue)
+        if blocked_note:
+            flattened_comment = " ".join(blocked_note.split())
+            lines.append(f"* {link_line} — {flattened_comment}")
+        else:
+            lines.append(f"* {link_line}")
+    return lines
 
 
 def build_markdown(
@@ -109,13 +219,18 @@ def build_markdown(
     anchor_date: date,
 ) -> str:
     """
-    Produce full Markdown for **Today** and **Tomorrow** relative to anchor_date.
+    Produce full Markdown for **Today**, **Tomorrow**, and **Blocked** relative to anchor_date.
 
     anchor_date is the logical \"today\" for the report (usually the current day
     in the configured timezone). The **Tomorrow** block uses the next **weekday**
-    (Mon–Fri) after ``anchor_date``, so e.g. on Friday it plans for Monday. The **R&T** line
-    under Tomorrow is included only when the calendar shows an R&T event on
-    that planning day (same substring rule as ``#review`` for today).
+    (Mon–Fri) after ``anchor_date``, so e.g. on Friday it plans for Monday. The **R&T**
+    subsection under Tomorrow appears when the calendar has an R&T event on that
+    planning day *or* when the tomorrow dev filter returns at least one R&T task
+    (same summary substring rule as today’s **R&T** bucket).
+
+    **Blocked** lists issues returned by ``FILTER_BLOCKED_PARENTS_ID`` that are flagged,
+    using each row's own key only (the filter is expected to already return the parent
+    tickets). Your latest \"Blocked\" comment on that issue is included when present.
     """
     tz = ZoneInfo(settings.timezone_name)
     today = anchor_date
@@ -177,8 +292,17 @@ def build_markdown(
     )
 
     issues_tomorrow_dev = client.search_filter(settings.filter_tomorrow_dev_id)
+    tomorrow_dev_non_deploy = [
+        issue for issue in issues_tomorrow_dev if not client.is_deploy_issue(issue)
+    ]
+    development_tomorrow, rt_tomorrow = partition_development_and_rt(
+        tomorrow_dev_non_deploy, client
+    )
     issues_tomorrow_deploy_raw = client.search_filter(settings.filter_tomorrow_deploy_id)
     deploy_tomorrow = [i for i in issues_tomorrow_deploy_raw if client.is_deploy_issue(i)]
+
+    issues_blocked = client.search_filter(settings.filter_blocked_parents_id)
+    blocked_entries = _collect_flagged_blocked_entries(client, issues_blocked)
 
     sections_today: list[str] = []
     sections_today.append("## Today")
@@ -213,16 +337,21 @@ def build_markdown(
     sections_tomorrow.append("")
 
     sections_tomorrow.append("**Development**")
-    dev_t_lines = _lines_development_tomorrow(client, issues_tomorrow_dev)
+    dev_t_lines = _lines_development_tomorrow(client, development_tomorrow)
     if dev_t_lines:
         sections_tomorrow.extend(dev_t_lines)
     else:
         sections_tomorrow.append(f"* {settings.new_ticket_message}")
     sections_tomorrow.append("")
 
-    if had_rt_planning:
+    show_rt_tomorrow = had_rt_planning or bool(rt_tomorrow)
+    if show_rt_tomorrow:
         sections_tomorrow.append("**R&T**")
-        sections_tomorrow.append("* On R&T")
+        if had_rt_planning:
+            sections_tomorrow.append("* On R&T")
+        rt_tomorrow_lines = _lines_rt_tomorrow(client, rt_tomorrow)
+        if rt_tomorrow_lines:
+            sections_tomorrow.extend(rt_tomorrow_lines)
         sections_tomorrow.append("")
 
     nd_t: list[str] = []
@@ -233,5 +362,12 @@ def build_markdown(
         sections_tomorrow.extend(nd_t)
         sections_tomorrow.append("")
 
-    body = "\n".join(sections_today + sections_tomorrow).strip() + "\n"
+    sections_blocked: list[str] = []
+    if blocked_entries:
+        sections_blocked.append("## Blocked")
+        sections_blocked.append("")
+        sections_blocked.extend(_lines_blocked_section(client, blocked_entries))
+        sections_blocked.append("")
+
+    body = "\n".join(sections_today + sections_tomorrow + sections_blocked).strip() + "\n"
     return body

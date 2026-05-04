@@ -31,6 +31,10 @@ class Settings:
     filter_today_id: str
     filter_tomorrow_dev_id: str
     filter_tomorrow_deploy_id: str
+    # Saved filter whose issues are scanned for flags (**Blocked**); rows are used as-is (expect parents).
+    filter_blocked_parents_id: str
+    # Custom field id for Impediment/Flagged when ``flagged`` is unavailable (e.g. customfield_10021).
+    jira_flagged_field_id: str | None
     ical_path: Path | None
     ical_url: str | None
     timezone_name: str
@@ -123,6 +127,11 @@ class Settings:
             filter_tomorrow_deploy_id=os.environ.get(
                 "FILTER_TOMORROW_DEPLOY_ID", "12561"
             ).strip(),
+            filter_blocked_parents_id=os.environ.get(
+                "FILTER_BLOCKED_PARENTS_ID", "12991"
+            ).strip(),
+            jira_flagged_field_id=os.environ.get("JIRA_FLAGGED_FIELD_ID", "").strip()
+            or None,
             ical_path=ical_path,
             ical_url=ical_url,
             timezone_name=tz,
