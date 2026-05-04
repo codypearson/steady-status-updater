@@ -200,13 +200,19 @@ def _lines_blocked_section(
     client: JiraClient,
     rows: list[tuple[JiraIssue, str | None]],
 ) -> list[str]:
-    """One Markdown bullet per blocked item: story/subtask link and optional blocked comment."""
+    """
+    One Markdown bullet per blocked issue using that row's **own** key, URL, and summary.
+
+    Unlike other sections, parent rollup is not applied—subtasks appear under their own key.
+    Optional ``Blocked`` comment text is nested as an indented sub-bullet under the issue line.
+    """
     lines: list[str] = []
     for issue, blocked_note in rows:
-        link_line = _display_issue_link(client, issue)
+        link_line = _md_browse_link(client, issue.key, issue.summary)
         if blocked_note:
             flattened_comment = " ".join(blocked_note.split())
-            lines.append(f"* {link_line} — {flattened_comment}")
+            lines.append(f"* {link_line}")
+            lines.append(f"  * {flattened_comment}")
         else:
             lines.append(f"* {link_line}")
     return lines
@@ -230,7 +236,8 @@ def build_markdown(
 
     **Blocked** lists issues returned by ``FILTER_BLOCKED_PARENTS_ID`` that are flagged,
     using each row's own key only (the filter is expected to already return the parent
-    tickets). Your latest \"Blocked\" comment on that issue is included when present.
+    tickets). Lines show that row's key and title (not parent rollup). Your latest
+    \"Blocked\" comment on that issue is included when present.
     """
     tz = ZoneInfo(settings.timezone_name)
     today = anchor_date
