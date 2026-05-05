@@ -94,18 +94,23 @@ def _lines_rt_today(
     ☑️ when your issue comment includes the configured approval header (see
     ``JIRA_RT_APPROVED_COMMENT_HEADER``); otherwise 🔙.
 
-    Subtasks under the same parent share one parent link line; each nested line
-    carries the approval emoji and subtask summary. Tomorrow’s **R&T** list does
-    not use this formatting—see :func:`_lines_rt_tomorrow`.
+    For ``Review & Test`` subtasks grouped under a story, the emoji prefixes the
+    parent ticket line (approval is checked on the subtask issue). Nested bullets
+    that only repeat the configured R&T summary substring are omitted. Other
+    subtasks under the same parent still appear as nested lines with emoji.
+    Tomorrow’s **R&T** list uses a simpler layout—see :func:`_lines_rt_tomorrow`.
     """
     lines: list[str] = []
     for group in _group_issues_by_parent(issues):
         first = group[0]
         if first.parent_key:
-            lines.append(f"* {_display_issue_link(client, first)}")
+            emoji = rt_comment_approval_emoji(client, first.key)
+            lines.append(f"* {emoji} {_display_issue_link(client, first)}")
             for issue in group:
-                emoji = rt_comment_approval_emoji(client, issue.key)
-                lines.append(f"  * {emoji} {issue.summary}")
+                if client.is_rt_summary(issue):
+                    continue
+                nested_emoji = rt_comment_approval_emoji(client, issue.key)
+                lines.append(f"  * {nested_emoji} {issue.summary}")
         else:
             issue = group[0]
             emoji = rt_comment_approval_emoji(client, issue.key)
@@ -229,10 +234,11 @@ def build_markdown(
 
     anchor_date is the logical \"today\" for the report (usually the current day
     in the configured timezone). The **Tomorrow** block uses the next **weekday**
-    (Mon–Fri) after ``anchor_date``, so e.g. on Friday it plans for Monday. The **R&T**
-    subsection under Tomorrow appears when the calendar has an R&T event on that
-    planning day *or* when the tomorrow dev filter returns at least one R&T task
-    (same summary substring rule as today’s **R&T** bucket).
+    (Mon–Fri) after ``anchor_date``, so e.g. on Friday it plans for Monday.
+    The **R&T** subsection under **Today** appears when the calendar has an R&T event
+    on that day *or* when the today filter returns at least one R&T-classified task.
+    Under **Tomorrow**, the same idea applies using the planning weekday and the
+    tomorrow dev filter (same JIRA summary substring rule for both).
 
     **Blocked** lists issues returned by ``FILTER_BLOCKED_PARENTS_ID`` that are flagged,
     using each row's own key only (the filter is expected to already return the parent
@@ -311,10 +317,12 @@ def build_markdown(
     issues_blocked = client.search_filter(settings.filter_blocked_parents_id)
     blocked_entries = _collect_flagged_blocked_entries(client, issues_blocked)
 
+    show_rt_today = had_rt_cal or bool(rt_today)
+
     sections_today: list[str] = []
     sections_today.append("## Today")
     sections_today.append("")
-    if had_rt_cal:
+    if show_rt_today:
         sections_today.append("#review")
         sections_today.append("")
 
@@ -324,7 +332,7 @@ def build_markdown(
         sections_today.extend(dev_lines)
     sections_today.append("")
 
-    if had_rt_cal:
+    if show_rt_today:
         sections_today.append("**R&T**")
         rt_lines = _lines_rt_today(client, rt_today)
         if rt_lines:
