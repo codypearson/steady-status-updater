@@ -35,6 +35,29 @@ class JiraIssue:
             return self.parent_summary
         return self.summary
 
+    def rollup_group_key(self) -> str:
+        """
+        Key used to group subtasks with their parent in reports.
+
+        Matches :func:`partition_today_bundle` grouping: parent story key when the
+        row is a subtask, otherwise the issue's own key.
+        """
+        return self.parent_key if self.parent_key else self.key
+
+
+def _norm_status(issue: JiraIssue) -> str:
+    return issue.status_name.strip().lower()
+
+
+def is_done_status(issue: JiraIssue) -> bool:
+    """True when the issue is in Jira status *Done* (case-insensitive)."""
+    return _norm_status(issue) == "done"
+
+
+def is_in_progress_status(issue: JiraIssue) -> bool:
+    """True when the issue is in Jira status *In Progress* (case-insensitive)."""
+    return _norm_status(issue) == "in progress"
+
 
 def _auth_header(email: str, api_token: str) -> str:
     raw = f"{email}:{api_token}".encode("utf-8")

@@ -278,12 +278,26 @@ def filter_events_excluding_substring(
     return [e for e in events if needle not in e.summary.lower()]
 
 
+def _format_time_12h(dt: datetime) -> str:
+    """
+    Format a local ``datetime`` as 12-hour clock with ``am`` / ``pm`` (no leading
+    zero on the hour, minutes zero-padded).
+    """
+    hour24 = dt.hour
+    minute = dt.minute
+    suffix = "am" if hour24 < 12 else "pm"
+    hour12 = hour24 % 12
+    if hour12 == 0:
+        hour12 = 12
+    return f"{hour12}:{minute:02d} {suffix}"
+
+
 def format_meeting_line(ev: CalendarEvent) -> str:
     """Single bullet line for a meeting or calendar block."""
     if ev.start_local is not None and not ev.is_all_day:
-        start_t = ev.start_local.strftime("%H:%M")
+        start_t = _format_time_12h(ev.start_local)
         if ev.end_local is not None:
-            end_t = ev.end_local.strftime("%H:%M")
+            end_t = _format_time_12h(ev.end_local)
             return f"{ev.summary} ({start_t}–{end_t})"
         return f"{ev.summary} ({start_t})"
     return ev.summary

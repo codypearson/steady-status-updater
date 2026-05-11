@@ -18,6 +18,8 @@ from steady_status.ical_feed import (
 from steady_status.jira_client import (
     JiraClient,
     JiraIssue,
+    is_done_status,
+    is_in_progress_status,
     partition_development_and_rt,
     partition_today_bundle,
     rt_comment_approval_emoji,
@@ -137,6 +139,41 @@ def _lines_meetings(events: list[CalendarEvent]) -> list[str]:
     return [f"* 📅 {format_meeting_line(ev)}" for ev in events]
 
 
+def _partition_deploy_by_status(
+    deploy_today: list[JiraIssue],
+    deploy_tomorrow: list[JiraIssue],
+) -> tuple[list[JiraIssue], list[JiraIssue]]:
+    """
+    Split deploy issues so they appear under **Today** vs **Tomorrow** by Jira status.
+
+    * **Done** → listed only under **Today** (from the today filter).
+    * **In Progress** → listed only under **Tomorrow**, even when the same issue
+      also matches the today filter (deduped by parent/story or issue key).
+
+    Other statuses are omitted from both sections.
+    """
+    today_deploy = [issue for issue in deploy_today if is_done_status(issue)]
+
+    seen_keys: set[str] = set()
+    tomorrow_deploy: list[JiraIssue] = []
+
+    def _append_in_progress(issue: JiraIssue) -> None:
+        if not is_in_progress_status(issue):
+            return
+        group_key = issue.rollup_group_key()
+        if group_key in seen_keys:
+            return
+        seen_keys.add(group_key)
+        tomorrow_deploy.append(issue)
+
+    for issue in deploy_tomorrow:
+        _append_in_progress(issue)
+    for issue in deploy_today:
+        _append_in_progress(issue)
+
+    return today_deploy, tomorrow_deploy
+
+
 def _lines_development_tomorrow(client: JiraClient, issues: list[JiraIssue]) -> list[str]:
     """Next business day **Development**: issue links; subtasks nested under the parent line."""
     if not issues:
@@ -244,6 +281,10 @@ def build_markdown(
     using each row's own key only (the filter is expected to already return the parent
     tickets). Lines show that row's key and title (not parent rollup). Your latest
     \"Blocked\" comment on that issue is included when present.
+
+    Deploy-type issues: **Done** appears only under **Today** → **Non-Development**;
+    **In Progress** only under **Tomorrow**, so issues matched by both saved filters
+    are not duplicated across days.
     """
     tz = ZoneInfo(settings.timezone_name)
     today = anchor_date
@@ -300,7 +341,7 @@ def build_markdown(
         meetings_tomorrow = meetings_tomorrow_raw
 
     issues_today = client.search_filter(settings.filter_today_id)
-    deploy_today, development_today, rt_today = partition_today_bundle(
+    deploy_today_raw, development_today, rt_today = partition_today_bundle(
         issues_today, client
     )
 
@@ -312,7 +353,11 @@ def build_markdown(
         tomorrow_dev_non_deploy, client
     )
     issues_tomorrow_deploy_raw = client.search_filter(settings.filter_tomorrow_deploy_id)
-    deploy_tomorrow = [i for i in issues_tomorrow_deploy_raw if client.is_deploy_issue(i)]
+    deploy_tomorrow_raw = [i for i in issues_tomorrow_deploy_raw if client.is_deploy_issue(i)]
+    deploy_today, deploy_tomorrow = _partition_deploy_by_status(
+        deploy_today_raw,
+        deploy_tomorrow_raw,
+    )
 
     issues_blocked = client.search_filter(settings.filter_blocked_parents_id)
     blocked_entries = _collect_flagged_blocked_entries(client, issues_blocked)
