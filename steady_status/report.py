@@ -272,10 +272,13 @@ def build_markdown(
     anchor_date is the logical \"today\" for the report (usually the current day
     in the configured timezone). The **Tomorrow** block uses the next **weekday**
     (Mon–Fri) after ``anchor_date``, so e.g. on Friday it plans for Monday.
-    The **R&T** subsection under **Today** appears when the calendar has an R&T event
-    on that day *or* when the today filter returns at least one R&T-classified task.
-    Under **Tomorrow**, the same idea applies using the planning weekday and the
-    tomorrow dev filter (same JIRA summary substring rule for both).
+    The ``#review`` hashtag appears under **Today** or **Tomorrow** only when the
+    calendar shows an R&T block on that section's calendar day: ``anchor_date`` for
+    **Today**, and the next weekday ``planning_day`` for **Tomorrow** (substring
+    ``CAL_RT_EVENT_SUBSTRING``). Calendar checks for R&T / ``#review`` always include
+    all-day events, independent of ``STEADY_INCLUDE_ALL_DAY_MEETINGS`` (that setting
+    only affects **Non-Development** meeting bullets). The **R&T** JIRA subsections
+    still follow calendar *or* matching JIRA filter rows as before.
 
     **Blocked** lists issues returned by ``FILTER_BLOCKED_PARENTS_ID`` that are flagged,
     using each row's own key only (the filter is expected to already return the parent
@@ -293,12 +296,15 @@ def build_markdown(
     include_all_day = settings.include_all_day_meetings
     cal_owner = settings.calendar_user_email
     cal_rsp = settings.cal_filter_attendee_response
+    # All-day R&T blocks count for #review / had_rt_* even when meeting lists omit
+    # all-day (STEADY_INCLUDE_ALL_DAY_MEETINGS off).
+    include_all_day_for_rt_calendar = True
     had_rt_cal = had_rt_event_today(
         cal,
         today,
         tz,
         settings.cal_rt_event_substring,
-        include_all_day,
+        include_all_day_for_rt_calendar,
         attendee_email=cal_owner,
         filter_attendee_response=cal_rsp,
     )
@@ -307,7 +313,7 @@ def build_markdown(
         planning_day,
         tz,
         settings.cal_rt_event_substring,
-        include_all_day,
+        include_all_day_for_rt_calendar,
         attendee_email=cal_owner,
         filter_attendee_response=cal_rsp,
     )
@@ -363,11 +369,13 @@ def build_markdown(
     blocked_entries = _collect_flagged_blocked_entries(client, issues_blocked)
 
     show_rt_today = had_rt_cal or bool(rt_today)
+    show_review_hashtag_today = had_rt_cal
+    show_review_hashtag_tomorrow = had_rt_planning
 
     sections_today: list[str] = []
     sections_today.append("## Today")
     sections_today.append("")
-    if show_rt_today:
+    if show_review_hashtag_today:
         sections_today.append("#review")
         sections_today.append("")
 
@@ -395,6 +403,9 @@ def build_markdown(
     sections_tomorrow: list[str] = []
     sections_tomorrow.append("## Tomorrow")
     sections_tomorrow.append("")
+    if show_review_hashtag_tomorrow:
+        sections_tomorrow.append("#review")
+        sections_tomorrow.append("")
 
     sections_tomorrow.append("**Development**")
     dev_t_lines = _lines_development_tomorrow(client, development_tomorrow)

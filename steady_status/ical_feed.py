@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -119,7 +119,10 @@ def had_rt_event_today(
     """
     Return True if any event on `today` matches the R&T calendar substring.
 
-    Used for `#review` and for showing the **R&T** JIRA subsection.
+    Drives calendar-based R&T detection in the report (including the ``#review``
+    hashtag when this is true for the queried day). Callers should pass
+    ``include_all_day=True`` for R&T detection so all-day blocks count even when
+    meeting lists omit all-day events.
     """
     needle = rt_substring.lower()
     if not needle:
@@ -148,6 +151,10 @@ def iter_day_events(
 ) -> list[CalendarEvent]:
     """
     Collect events that overlap `day` in `tz`, excluding all-day by default.
+
+    All-day events use ``VALUE=DATE`` when the feed provides it. Feeds that encode
+    all-day blocks as UTC midnight-to-midnight ``DATE-TIME`` pairs are matched by
+    UTC calendar date instead of local overlap (see :func:`_utc_midnight_all_day_date_range`).
 
     Events are de-duplicated by (summary, start_local iso) when possible.
 
@@ -182,6 +189,65 @@ def _event_sort_key(ev: CalendarEvent) -> str:
     return ev.summary.lower()
 
 
+def _to_local(dt: datetime, tz: ZoneInfo) -> datetime:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+    return dt.astimezone(tz)
+
+
+def _to_utc(dt: datetime) -> datetime:
+    """Normalize ``dt`` to aware UTC (naive values are treated as UTC)."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _utc_midnight_all_day_date_range(
+    start_utc: datetime,
+    end_utc: datetime,
+) -> tuple[date, date] | None:
+    """
+    If ``start_utc``/``end_utc`` are both at 00:00 UTC and ``end_utc`` is a positive
+    multiple of whole days after ``start_utc``, return ``(first_day, last_day)``
+    where the event occupies every UTC calendar date ``d`` with
+    ``first_day <= d < last_day`` (half-open, same rule as ``VALUE=DATE`` DTEND).
+
+    Many feeds encode all-day blocks as ``DTSTART:...T000000Z`` / ``DTEND:...T000000Z``
+    instead of ``VALUE=DATE``. Converting those instants to local time makes the
+    interval overlap the *previous* local calendar evening, which incorrectly
+    triggers R&T / ``#review`` a day early. Treating them as UTC-dated all-day
+    fixes that while leaving true timed events (non-midnight UTC bounds) on the
+    existing overlap logic.
+    """
+    if start_utc.time() != time.min or end_utc.time() != time.min:
+        return None
+    delta = end_utc - start_utc
+    if delta <= timedelta(0):
+        return None
+    if delta.total_seconds() % 86400 != 0:
+        return None
+    return (start_utc.date(), end_utc.date())
+
+
+def _local_range_overlaps_day(
+    start_local: datetime,
+    end_local: datetime | None,
+    day: date,
+) -> bool:
+    """True if the timed event intersects the calendar date `day` in local time."""
+    start_date = start_local.date()
+    if end_local is None:
+        return start_date == day
+    end_date = end_local.date()
+    if start_date <= day <= end_date:
+        return True
+    if start_local.date() == day:
+        return True
+    if end_local.date() == day:
+        return True
+    return False
+
+
 def _component_to_event(
     component: Any,
     day: date,
@@ -205,6 +271,24 @@ def _component_to_event(
 
     # datetime is a subclass of date — classify timed events before date-only.
     if isinstance(dtstart, datetime):
+        start_utc = _to_utc(dtstart)
+        end_utc: datetime | None = None
+        if isinstance(dtend, datetime):
+            end_utc = _to_utc(dtend)
+
+        if include_all_day and end_utc is not None:
+            utc_day_range = _utc_midnight_all_day_date_range(start_utc, end_utc)
+            if utc_day_range is not None:
+                first_utc_day, end_exclusive_utc_day = utc_day_range
+                if first_utc_day <= day < end_exclusive_utc_day:
+                    return CalendarEvent(
+                        summary=summary,
+                        start_local=None,
+                        end_local=None,
+                        is_all_day=True,
+                    )
+                return None
+
         start_local = _to_local(dtstart, tz)
         end_local = None
         if isinstance(dtend, datetime):
@@ -235,31 +319,6 @@ def _component_to_event(
         return None
 
     return None
-
-
-def _to_local(dt: datetime, tz: ZoneInfo) -> datetime:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=ZoneInfo("UTC"))
-    return dt.astimezone(tz)
-
-
-def _local_range_overlaps_day(
-    start_local: datetime,
-    end_local: datetime | None,
-    day: date,
-) -> bool:
-    """True if the timed event intersects the calendar date `day` in local time."""
-    start_date = start_local.date()
-    if end_local is None:
-        return start_date == day
-    end_date = end_local.date()
-    if start_date <= day <= end_date:
-        return True
-    if start_local.date() == day:
-        return True
-    if end_local.date() == day:
-        return True
-    return False
 
 
 def filter_events_excluding_substring(
